@@ -29,8 +29,27 @@ OUTPUT_DIR = Path("/tmp/clipforge/outputs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── In-memory job store ────────────────────────────────────────────────────────
-jobs: dict = {}
+# ── Disk-based job store (/tmp survives within same instance, safer than memory)
+JOBS_DIR = Path("/tmp/clipforge/jobs")
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+def job_read(job_id: str) -> dict | None:
+    p = JOBS_DIR / f"{job_id}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+def job_write(job_id: str, data: dict):
+    p = JOBS_DIR / f"{job_id}.json"
+    p.write_text(json.dumps(data))
+
+def job_delete(job_id: str):
+    p = JOBS_DIR / f"{job_id}.json"
+    if p.exists():
+        p.unlink()
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class CutSettings(BaseModel):
@@ -135,10 +154,16 @@ def scale_filter(aspect_ratio: str) -> str:
     return m.get(aspect_ratio, m["16:9"])
 
 # ── Background task ────────────────────────────────────────────────────────────
+def update_job(job_id: str, **kwargs):
+    """Read job from disk, update fields, write back."""
+    job = job_read(job_id) or {}
+    job.update(kwargs)
+    job_write(job_id, job)
+    return job
+
 async def run_job(job_id: str, file_paths: list, settings: CutSettings):
-    job = jobs[job_id]
     try:
-        job.update(status="processing", progress=5, message="Checking FFmpeg...")
+        update_job(job_id, status="processing", progress=5, message="Checking FFmpeg...")
         if not ffmpeg_ok():
             raise RuntimeError("FFmpeg not found on server")
 
@@ -150,17 +175,17 @@ async def run_job(job_id: str, file_paths: list, settings: CutSettings):
             label = Path(fp).name
             base = 10 + idx * step
 
-            job.update(progress=base, message=f"[{idx+1}/{len(file_paths)}] Analysing: {label}")
+            update_job(job_id, progress=base, message=f"[{idx+1}/{len(file_paths)}] Analysing: {label}")
             duration = get_duration(fp)
             total_orig += duration
 
-            job.update(progress=base + int(step*0.25), message=f"[{idx+1}/{len(file_paths)}] Silence detection...")
+            update_job(job_id, progress=base + int(step*0.25), message=f"[{idx+1}/{len(file_paths)}] Silence detection...")
             silences = detect_silence(fp, settings.silence_threshold) if settings.remove_silence else []
 
-            job.update(progress=base + int(step*0.5), message=f"[{idx+1}/{len(file_paths)}] Scene detection...")
+            update_job(job_id, progress=base + int(step*0.5), message=f"[{idx+1}/{len(file_paths)}] Scene detection...")
             scenes = detect_scenes(fp) if settings.scene_detect else []
 
-            job.update(progress=base + int(step*0.7), message=f"[{idx+1}/{len(file_paths)}] Building cuts...")
+            update_job(job_id, progress=base + int(step*0.7), message=f"[{idx+1}/{len(file_paths)}] Building cuts...")
             cuts = build_cuts(duration, silences, scenes, settings)
             keeps = invert_cuts(duration, cuts, settings.min_clip_length) or [(0.0, duration)]
 
@@ -184,7 +209,7 @@ async def run_job(job_id: str, file_paths: list, settings: CutSettings):
                 concat_inputs.append(str(out))
                 total_kept += seg_dur
 
-        job.update(progress=82, message="Concatenating clips...")
+        update_job(job_id, progress=82, message="Concatenating clips...")
 
         # Trim to target duration
         if settings.target_duration > 0 and total_kept > settings.target_duration:
@@ -209,7 +234,7 @@ async def run_job(job_id: str, file_paths: list, settings: CutSettings):
         out_name = f"{job_id}_output.{ext}"
         out_path = OUTPUT_DIR / out_name
 
-        job.update(progress=88, message="Rendering final video...")
+        update_job(job_id, progress=88, message="Rendering final video...")
 
         concat_file = UPLOAD_DIR / f"{job_id}_list.txt"
         with open(concat_file, "w") as f:
@@ -241,7 +266,7 @@ async def run_job(job_id: str, file_paths: list, settings: CutSettings):
         except: pass
 
         final_dur = get_duration(str(out_path))
-        job.update(
+        update_job(job_id,
             status="done", progress=100, message="Complete!",
             output_file=out_name,
             cuts=all_cuts,
@@ -254,7 +279,7 @@ async def run_job(job_id: str, file_paths: list, settings: CutSettings):
             }
         )
     except Exception as exc:
-        job.update(status="error", progress=0, message=str(exc))
+        update_job(job_id, status="error", progress=0, message=str(exc))
         for fp in file_paths:
             try: os.remove(fp)
             except: pass
@@ -316,16 +341,17 @@ async def process(req: ProcessRequest, background_tasks: BackgroundTasks):
         file_paths.append(str(matches[0]))
 
     jid = str(uuid.uuid4())
-    jobs[jid] = {"job_id": jid, "status": "queued", "progress": 0,
-                 "message": "Queued...", "cuts": [], "output_file": None, "stats": {}}
+    job_write(jid, {"job_id": jid, "status": "queued", "progress": 0,
+                    "message": "Queued...", "cuts": [], "output_file": None, "stats": {}})
     background_tasks.add_task(run_job, jid, file_paths, req.settings)
     return {"job_id": jid}
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    if job_id not in jobs:
+    job = job_read(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
-    return jobs[job_id]
+    return job
 
 @app.get("/download/{filename}")
 def download(filename: str):
@@ -340,10 +366,11 @@ def download(filename: str):
 
 @app.delete("/cleanup/{job_id}")
 def cleanup(job_id: str):
-    if job_id not in jobs:
+    job = job_read(job_id)
+    if not job:
         raise HTTPException(404, "Job not found")
-    job = jobs.pop(job_id)
     if job.get("output_file"):
         try: os.remove(OUTPUT_DIR / job["output_file"])
         except: pass
+    job_delete(job_id)
     return {"deleted": job_id}
