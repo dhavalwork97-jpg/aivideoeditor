@@ -23,14 +23,17 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# ── Dirs (/tmp is always writable on Render free tier) ─────────────────────────
-UPLOAD_DIR = Path("/tmp/clipforge/uploads")
-OUTPUT_DIR = Path("/tmp/clipforge/outputs")
+# ── Dirs — use ./data locally, /tmp on Render ─────────────────────────────────
+if os.environ.get("CLIPFORGE_LOCAL") or os.name == "nt":
+    BASE = Path(__file__).parent / "data"
+else:
+    BASE = Path("/tmp/clipforge")
+
+UPLOAD_DIR = BASE / "uploads"
+OUTPUT_DIR = BASE / "outputs"
+JOBS_DIR   = BASE / "jobs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Disk-based job store (/tmp survives within same instance, safer than memory)
-JOBS_DIR = Path("/tmp/clipforge/jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 def job_read(job_id: str) -> dict | None:
