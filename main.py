@@ -31,11 +31,12 @@ app.add_middleware(
 )
 
 # ─── Directory Setup ───────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+# Use /tmp on Render (ephemeral but writable on free tier)
+BASE_DIR = Path("/tmp/clipforge")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory job store (use Redis/DB in production)
 jobs: dict = {}
@@ -508,16 +509,21 @@ async def upload_videos(files: List[UploadFile] = File(...)):
     return {"uploaded": saved}
 
 
+class ProcessRequest(BaseModel):
+    file_ids: List[str]
+    settings: CutSettings
+
 @app.post("/process")
 async def process_videos(
     background_tasks: BackgroundTasks,
-    file_ids: List[str],
-    settings: CutSettings
+    body: ProcessRequest,
 ):
     """
     Start an AI auto-cut processing job.
     Returns a job_id to poll for status.
     """
+    file_ids = body.file_ids
+    settings = body.settings
     if not file_ids:
         raise HTTPException(status_code=400, detail="No file IDs provided")
 
